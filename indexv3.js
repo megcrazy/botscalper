@@ -1,4 +1,4 @@
-// Bot_WRP_v4.js
+// Bot_CCI_v5.js
 require("dotenv").config();
 const axios = require("axios");
 const { Telegraf } = require("telegraf");
@@ -19,21 +19,23 @@ const RSI_PERIOD = 14;
 const ATR_PERIOD = 14;
 
 // --- ATR and RRR Config --- //
-// Multiplier for the re-entry point (previous stop)
 const ATR_REENTRY_MULTIPLIER = new Decimal(process.env.ATR_REENTRY_MULTIPLIER || "1.0");
-// Multiplier for the NEW, further stop loss
 const ATR_FINAL_STOP_MULTIPLIER = new Decimal(process.env.ATR_FINAL_STOP_MULTIPLIER || "2.5");
 
-const RRR_TARGET_1 = new Decimal(process.env.RRR_TARGET_1 || "1.5");
+const RRR_TARGET_1 = new Decimal(process.env.RRR_TARGET_1 || "1");
 const RRR_TARGET_2 = new Decimal(process.env.RRR_TARGET_2 || "2.5");
 const RRR_TARGET_3 = new Decimal(process.env.RRR_TARGET_3 || "3");
 
 // --- LSR Thresholds --- //
-const LSR_BUY_THRESHOLD = new Decimal(2.0);
-const LSR_SELL_THRESHOLD = new Decimal(1.8);
+const LSR_BUY_THRESHOLD = new Decimal(1.8);
+const LSR_SELL_THRESHOLD = new Decimal(2.0);
 
 // --- OI Percentage Change Thresholds --- //
-const OI_PERCENT_CHANGE_THRESHOLD = new Decimal(0.20); // 0.30% threshold for OI change
+const OI_PERCENT_CHANGE_THRESHOLD = new Decimal(0.20); // 0.20% threshold for OI change
+
+// ============ ANTI-SPAM DE SINAIS =========== //
+const ultimosSinais = {}; // { "<par>_LONG" ou "<par>_SHORT": timestamp }
+const TEMPO_MINIMO_ENTRE_SINAIS_MS = 30 * 60 * 1000; // 30 minutos
 
 // ================= HELPER FUNCTIONS ================= //
 
@@ -58,10 +60,6 @@ function calculatePercentChange(current, previous) {
         return { value: null, formatted: "N/A (Erro)" };
     }
 }
-
-// ================= INDICADORES ================= //
-
-
 
 function getEMASeries(closes, period) {
     if (closes.length < period + 1) return { current: null, previous: null };
@@ -196,8 +194,8 @@ class TradingBot {
                     this.fetchKlines(par, "1d", 100),
                 ]);
 
-                if (data3m.closes.length < 50) {
-                    console.log(`[${par}] Dados 3m insuficientes (${data3m.closes.length}).`);
+                if (data3m.closes.length < 50 || data1h.closes.length < 50) {
+                    console.log(`[${par}] Dados insuficientes (3m: ${data3m.closes.length}, 1h: ${data1h.closes.length}).`);
                     continue;
                 }
 
@@ -208,12 +206,34 @@ class TradingBot {
                 const currentAtr = calculateATR(data3m.highs, data3m.lows, data3m.closes);
                 const currentPrice = new Decimal(data3m.closes[data3m.closes.length - 1]);
                 const currentCci = calculateCCI(data3m.highs, data3m.lows, data3m.closes);
-                const cciValues = data3m.closes.map((c, i) => calculateCCI(data3m.highs.slice(0, i + 1), data3m.lows.slice(0, i + 1), data3m.closes.slice(0, i + 1))).filter(val => val !== null);
+                const cciValues = data3m.closes.map((c, i) =>
+                    calculateCCI(
+                        data3m.highs.slice(0, i + 1),
+                        data3m.lows.slice(0, i + 1),
+                        data3m.closes.slice(0, i + 1)
+                    )
+                ).filter(val => val !== null);
                 const cciSma = calculateSMA(cciValues, CCI_SMA_PERIOD);
                 const oiData = await this.fetchOpenInterest(par);
                 const lsrData = await this.fetchLSR(par);
 
-                if (currentPrice === null || currentAtr === null || ema17Series.current === null || ema34Series.current === null || oiData.current === null || lsrData.current === null) {
+                // NOVO: CCI do 1h para filtro em SHORT
+                const currentCci1h = calculateCCI(data1h.highs, data1h.lows, data1h.closes);
+                const cci1hValues = data1h.closes.map((c, i) =>
+                    calculateCCI(
+                        data1h.highs.slice(0, i + 1),
+                        data1h.lows.slice(0, i + 1),
+                        data1h.closes.slice(0, i + 1)
+                    )
+                ).filter(val => val !== null);
+                const cci1hSma = calculateSMA(cci1hValues, CCI_SMA_PERIOD);
+
+                if (
+                    currentPrice === null || currentAtr === null ||
+                    ema17Series.current === null || ema34Series.current === null ||
+                    oiData.current === null || lsrData.current === null ||
+                    currentCci1h === null || cci1hSma === null
+                ) {
                     console.log(`[${par}] Falha ao calcular dados essenciais. Pulando.`);
                     continue;
                 }
@@ -223,64 +243,79 @@ class TradingBot {
 
                 // --- Check Long Signal --- //
                 const isCciLong = currentCci?.gt(cciSma) && currentCci?.gt(new Decimal(-100));
-
                 const isCrossover = checkCrossover(ema17Series, ema34Series);
                 const isOiUp = oiChange.value?.isPositive();
-                // NOVA CONFLUÊNCIA: Verificar se a porcentagem de subida do OI é maior que 0.30%
                 const isOiUpEnough = isOiUp && oiChange.value?.gte(OI_PERCENT_CHANGE_THRESHOLD);
                 const isLsrFalling = lsrChange.value?.isNegative();
                 const lsrBelowThreshold = lsrData.current.lt(LSR_BUY_THRESHOLD);
 
-                // Modificado para incluir a nova confluência isOiUpEnough em vez de apenas isOiUp
+                const chaveLong = `${par}_LONG`;
+                const agora = Date.now();
                 if (isCciLong && isCrossover && isOiUpEnough && isLsrFalling && lsrBelowThreshold) {
-                    // Calculo entrada 2 e novo stop
-                    const reentryPrice = currentPrice.minus(currentAtr.times(ATR_REENTRY_MULTIPLIER));
-                    const finalStopLoss = currentPrice.minus(currentAtr.times(ATR_FINAL_STOP_MULTIPLIER));
-                    const risk = currentPrice.minus(finalStopLoss); // Risco baseado na entrada iniciale stop final
+                    if (
+                        ultimosSinais[chaveLong] &&
+                        (agora - ultimosSinais[chaveLong]) < TEMPO_MINIMO_ENTRE_SINAIS_MS
+                    ) {
+                        console.log(`[${par}] Sinal LONG já enviado recentemente. Pulando...`);
+                    } else {
+                        const reentryPrice = currentPrice.minus(currentAtr.times(ATR_REENTRY_MULTIPLIER));
+                        const finalStopLoss = currentPrice.minus(currentAtr.times(ATR_FINAL_STOP_MULTIPLIER));
+                        const risk = currentPrice.minus(finalStopLoss);
 
-                    // Targets 
-                    const target1 = currentPrice.plus(risk.times(RRR_TARGET_1));
-                    const target2 = currentPrice.plus(risk.times(RRR_TARGET_2));
-                    const target3 = currentPrice.plus(risk.times(RRR_TARGET_3));
+                        const target1 = currentPrice.plus(risk.times(RRR_TARGET_1));
+                        const target2 = currentPrice.plus(risk.times(RRR_TARGET_2));
+                        const target3 = currentPrice.plus(risk.times(RRR_TARGET_3));
 
-                    const msg = `🟢 *LONG* (${par})\n` +
-                              `*Entrys:* ${formatDecimal(currentPrice, 5)} - ${formatDecimal(reentryPrice, 5)}\n` +
-                              `Leverage: ${LEVERAGE_DEFAULT}X\n` +
-                              `*Tps:* ${formatDecimal(target1, 5)} - ${formatDecimal(target2, 5)} - ${formatDecimal(target3, 5)}\n` +
-                              `*Stop Loss:* ${formatDecimal(finalStopLoss, 5)}\n`                             ;                   
-                    await this.sendAlert(msg);
-                    console.log(`[${par}] Alerta LONG enviado.`);
+                        const msg = `🟢 *LONG* (${par})\n` +
+                            `*Entrys:* ${formatDecimal(currentPrice, 5)} - ${formatDecimal(reentryPrice, 5)}\n` +
+                            `Leverage: ${LEVERAGE_DEFAULT}X\n` +
+                            `*Tps:* ${formatDecimal(target1, 5)} - ${formatDecimal(target2, 5)} - ${formatDecimal(target3, 5)}\n` +
+                            `*Stop Loss:* ${formatDecimal(finalStopLoss, 5)}\n`;
+
+                        await this.sendAlert(msg);
+                        console.log(`[${par}] Alerta LONG enviado.`);
+                        ultimosSinais[chaveLong] = agora;
+                    }
                 }
 
                 // --- Check Short Signal --- //
+                // NOVO: só envia SHORT se CCI 15m e CCI 1h negativos em relação à sua SMA
                 const isCciShort = currentCci?.lt(cciSma) && currentCci?.lt(new Decimal(100));
-
+                const isCci1hShort = currentCci1h?.lt(cci1hSma) && currentCci1h?.lt(new Decimal(100));
                 const isCrossunder = checkCrossunder(ema17Series, ema34Series);
                 const isOiDown = oiChange.value?.isNegative();
-                // NOVA CONFLUÊNCIA: Verificar se a porcentagem de queda do OI é maior que 0.30% (em módulo)
                 const isOiDownEnough = isOiDown && oiChange.value?.abs().gte(OI_PERCENT_CHANGE_THRESHOLD);
                 const isLsrRising = lsrChange.value?.isPositive();
                 const lsrAboveThreshold = lsrData.current.gt(LSR_SELL_THRESHOLD);
 
-                // Modificado para incluir a nova confluência isOiDownEnough em vez de apenas isOiDown
-                if (isCciShort && isCrossunder && isOiDownEnough && isLsrRising && lsrAboveThreshold) {
-                    // Calculo da reentrada e stop
-                    const reentryPrice = currentPrice.plus(currentAtr.times(ATR_REENTRY_MULTIPLIER));
-                    const finalStopLoss = currentPrice.plus(currentAtr.times(ATR_FINAL_STOP_MULTIPLIER));
-                    const risk = finalStopLoss.minus(currentPrice); // Risco igual do long
+                const chaveShort = `${par}_SHORT`;
+                if (
+                    isCciShort && isCci1hShort && isCrossunder && isOiDownEnough && isLsrRising && lsrAboveThreshold
+                ) {
+                    if (
+                        ultimosSinais[chaveShort] &&
+                        (agora - ultimosSinais[chaveShort]) < TEMPO_MINIMO_ENTRE_SINAIS_MS
+                    ) {
+                        console.log(`[${par}] Sinal SHORT já enviado recentemente. Pulando...`);
+                    } else {
+                        const reentryPrice = currentPrice.plus(currentAtr.times(ATR_REENTRY_MULTIPLIER));
+                        const finalStopLoss = currentPrice.plus(currentAtr.times(ATR_FINAL_STOP_MULTIPLIER));
+                        const risk = finalStopLoss.minus(currentPrice);
 
-                    // Targets
-                    const target1 = currentPrice.minus(risk.times(RRR_TARGET_1));
-                    const target2 = currentPrice.minus(risk.times(RRR_TARGET_2));
-                    const target3 = currentPrice.minus(risk.times(RRR_TARGET_3));
+                        const target1 = currentPrice.minus(risk.times(RRR_TARGET_1));
+                        const target2 = currentPrice.minus(risk.times(RRR_TARGET_2));
+                        const target3 = currentPrice.minus(risk.times(RRR_TARGET_3));
 
-                    const msg = `🔴 *SHORT* (${par})\n` +
-                              `*Entrys:* ${formatDecimal(currentPrice, 5)}-${formatDecimal(reentryPrice, 5)}\n` +
-                              `Leverage: ${LEVERAGE_DEFAULT}X\n` +
-                              `*Tps :*${formatDecimal(target1, 5)} - ${formatDecimal(target2, 5)} - ${formatDecimal(target3, 5)}\n` +
-                              `*Stop Loss:* ${formatDecimal(finalStopLoss, 5)}\n`;
-                    await this.sendAlert(msg);
-                    console.log(`[${par}] Alerta SHORT enviado.`);
+                        const msg = `🔴 *SHORT* (${par})\n` +
+                            `*Entrys:* ${formatDecimal(currentPrice, 5)}-${formatDecimal(reentryPrice, 5)}\n` +
+                            `Leverage: ${LEVERAGE_DEFAULT}X\n` +
+                            `*Tps :*${formatDecimal(target1, 5)} - ${formatDecimal(target2, 5)} - ${formatDecimal(target3, 5)}\n` +
+                            `*Stop Loss:* ${formatDecimal(finalStopLoss, 5)}\n`;
+
+                        await this.sendAlert(msg);
+                        console.log(`[${par}] Alerta SHORT enviado.`);
+                        ultimosSinais[chaveShort] = agora;
+                    }
                 }
 
             } catch (err) {
@@ -304,12 +339,11 @@ setTimeout(() => botInstance.checkSignals(), 5000);
 setInterval(() => botInstance.checkSignals(), INTERVALO_VERIFICACAO_MS);
 
 process.on("unhandledRejection", (reason, promise) => {
-  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+    console.error("Unhandled Rejection at:", promise, "reason:", reason);
 });
 process.on("uncaughtException", (error) => {
-  console.error("Uncaught Exception thrown:", error);
+    console.error("Uncaught Exception thrown:", error);
 });
-
 
 function calculateCCI(highs, lows, closes, period = CCI_PERIOD) {
     if (highs.length < period || lows.length < period || closes.length < period) return null;
@@ -321,7 +355,7 @@ function calculateCCI(highs, lows, closes, period = CCI_PERIOD) {
             const slice = typicalPrices.slice(i - period + 1, i + 1);
             const sma = slice.reduce((a, b) => a.plus(b), new Decimal(0)).dividedBy(period);
             const meanDeviation = slice.reduce((sum, val) => sum.plus(val.minus(sma).abs()), new Decimal(0)).dividedBy(period);
-            
+
             if (meanDeviation.isZero()) {
                 cciResult.push(new Decimal(0));
             } else {
@@ -350,4 +384,3 @@ function calculateSMA(values, period) {
         return null;
     }
 }
-
