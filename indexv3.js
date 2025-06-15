@@ -24,8 +24,8 @@ const ATR_REENTRY_MULTIPLIER = new Decimal(process.env.ATR_REENTRY_MULTIPLIER ||
 // Multiplier for the NEW, further stop loss
 const ATR_FINAL_STOP_MULTIPLIER = new Decimal(process.env.ATR_FINAL_STOP_MULTIPLIER || "2.5");
 
-const RRR_TARGET_1 = new Decimal(process.env.RRR_TARGET_1 || "1");
-const RRR_TARGET_2 = new Decimal(process.env.RRR_TARGET_2 || "2");
+const RRR_TARGET_1 = new Decimal(process.env.RRR_TARGET_1 || "1.5");
+const RRR_TARGET_2 = new Decimal(process.env.RRR_TARGET_2 || "2.5");
 const RRR_TARGET_3 = new Decimal(process.env.RRR_TARGET_3 || "3");
 
 // --- LSR Thresholds --- //
