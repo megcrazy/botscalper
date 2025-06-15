@@ -9,11 +9,11 @@ const { Decimal } = require("decimal.js");
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const PARES_MONITORADOS = (process.env.PARES_MONITORADOS || "BTCUSDT,ETHUSDT").split(",");
-const INTERVALO_VERIFICACAO_MS = parseInt(process.env.INTERVALO_VERIFICACAO_MS || "300000", 10);
+const INTERVALO_VERIFICACAO_MS = parseInt(process.env.INTERVALO_VERIFICACAO_MS || "500000", 10);
 const LEVERAGE_DEFAULT = parseInt(process.env.LEVERAGE_DEFAULT || "5");
 
-const CCI_PERIOD = 14;
-const CCI_SMA_PERIOD = 9;
+const CCI_PERIOD = 20;
+const CCI_SMA_PERIOD = 14;
 const EMA_3M_PERIODS = [17, 13, 34];
 const RSI_PERIOD = 14;
 const ATR_PERIOD = 14;
