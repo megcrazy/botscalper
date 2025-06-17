@@ -307,8 +307,8 @@ Leverage: ${LEVERAGE_DEFAULT}X
                 }
 
                 // SHORT SIGNAL
-                const isCciShort = currentCci?.lt(cciSma) && currentCci?.lt(new Decimal(-100));
-                const isCci1hShort = currentCci1h?.lt(cci1hSma) && currentCci1h?.lt(new Decimal(-100));
+                const isCciShort = currentCci?.lt(cciSma) && currentCci?.lt(new Decimal(100));
+                const isCci1hShort = currentCci1h?.lt(cci1hSma) && currentCci1h?.lt(new Decimal(100));
                 const isCrossunder = checkCrossunder(ema17Series, ema34Series);
                 const isOiDownEnough = oiChange.value?.isNegative() && oiChange.value?.abs().gte(OI_PERCENT_CHANGE_THRESHOLD);
                 const isLsrRising = lsrChange.value?.isPositive();
