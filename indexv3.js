@@ -1,10 +1,9 @@
-// Bot_CCI_v5_With_VolumeDelta_and_ATR_Targets.js
+// Bot_CCI_v5.js
 require("dotenv").config();
 const axios = require("axios");
 const { Telegraf } = require("telegraf");
-const { RSI, ATR } = require("technicalindicators");
+const { RSI, ATR, WilliamsR } = require("technicalindicators");
 const { Decimal } = require("decimal.js");
-const WebSocket = require("ws");
 
 // ================= CONFIG ================= //
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -12,18 +11,20 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const PARES_MONITORADOS = (process.env.PARES_MONITORADOS || "BTCUSDT,ETHUSDT").split(",");
 const INTERVALO_VERIFICACAO_MS = parseInt(process.env.INTERVALO_VERIFICACAO_MS || "300000", 10);
 const LEVERAGE_DEFAULT = parseInt(process.env.LEVERAGE_DEFAULT || "5");
+
 const CCI_PERIOD = 20;
 const CCI_SMA_PERIOD = 14;
 const EMA_3M_PERIODS = [17, 13, 34];
 const RSI_PERIOD = 14;
 const ATR_PERIOD = 14;
 
-// --- ATR and Target Config --- //
+// --- ATR and RRR Config --- //
 const ATR_REENTRY_MULTIPLIER = new Decimal(process.env.ATR_REENTRY_MULTIPLIER || "1.0");
 const ATR_FINAL_STOP_MULTIPLIER = new Decimal(process.env.ATR_FINAL_STOP_MULTIPLIER || "2.5");
-const TARGET_1_ATR_MULT = new Decimal(process.env.TARGET_1_ATR_MULT || "1");
-const TARGET_2_ATR_MULT = new Decimal(process.env.TARGET_2_ATR_MULT || "2.5");
-const TARGET_3_ATR_MULT = new Decimal(process.env.TARGET_3_ATR_MULT || "3");
+
+const RRR_TARGET_1 = new Decimal(process.env.RRR_TARGET_1 || "1");
+const RRR_TARGET_2 = new Decimal(process.env.RRR_TARGET_2 || "2.5");
+const RRR_TARGET_3 = new Decimal(process.env.RRR_TARGET_3 || "3");
 
 // --- LSR Thresholds --- //
 const LSR_BUY_THRESHOLD = new Decimal(1.8);
@@ -36,11 +37,8 @@ const OI_PERCENT_CHANGE_THRESHOLD = new Decimal(0.20); // 0.20% threshold for OI
 const ultimosSinais = {}; // { "<par>_LONG" ou "<par>_SHORT": timestamp }
 const TEMPO_MINIMO_ENTRE_SINAIS_MS = 30 * 60 * 1000; // 30 minutos
 
-// ============ VOLUME DELTA STORAGE =========== //
-const volumeDeltaStore = {}; // { "BTCUSDT": { buyVolume: Decimal, sellVolume: Decimal, normalizedDelta: Decimal, lastUpdated: timestamp } }
-const VOLUME_DELTA_THRESHOLD = new Decimal(0.1); // Threshold for normalized delta
-
 // ================= HELPER FUNCTIONS ================= //
+
 function formatDecimal(value, places = 5) {
     if (value === null || value === undefined) return "N/A";
     try {
@@ -113,91 +111,6 @@ function checkCrossunder(fast, slow) {
         fast.previous.gte(slow.previous) && fast.current.lt(slow.current);
 }
 
-// --- CCI Calculation --- //
-function calculateSMA(data, period) {
-    if (data.length < period) return null;
-    const sum = data.slice(-period).reduce((acc, val) => acc.plus(val), new Decimal(0));
-    return sum.dividedBy(period);
-}
-
-function calculateCCI(highs, lows, closes, period = CCI_PERIOD) {
-    if (highs.length < period || lows.length < period || closes.length < period) return null;
-
-    const tpValues = []; // Typical Price (High + Low + Close) / 3
-    for (let i = 0; i < highs.length; i++) {
-        tpValues.push(new Decimal(highs[i]).plus(new Decimal(lows[i])).plus(new Decimal(closes[i])).dividedBy(3));
-    }
-
-    if (tpValues.length < period) return null;
-
-    const lastTpValues = tpValues.slice(-period);
-    const smaTp = calculateSMA(lastTpValues, period);
-
-    if (smaTp === null) return null;
-
-    let meanDeviation = new Decimal(0);
-    for (let i = 0; i < period; i++) {
-        meanDeviation = meanDeviation.plus(lastTpValues[i].minus(smaTp).abs());
-    }
-    meanDeviation = meanDeviation.dividedBy(period);
-
-    if (meanDeviation.isZero()) return new Decimal(0); // Avoid division by zero
-
-    const lastTp = tpValues[tpValues.length - 1];
-    const cci = lastTp.minus(smaTp).dividedBy(new Decimal(0.015).times(meanDeviation));
-
-    return cci;
-}
-
-// ================= WEBSOCKET VOLUME DELTA ================= //
-function startVolumeDeltaSocket(symbol) {
-    const ws = new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}@trade`);
-
-    // Initialize store for this symbol
-    volumeDeltaStore[symbol] = { buyVolume: new Decimal(0), sellVolume: new Decimal(0), normalizedDelta: new Decimal(0), lastUpdated: Date.now() };
-
-    ws.on("message", (data) => {
-        try {
-            const trade = JSON.parse(data.toString());
-            // Ensure trade.qty and trade.isBuyerMaker exist and are valid
-            if (trade && trade.qty !== undefined && trade.isBuyerMaker !== undefined) {
-                const quantity = new Decimal(trade.qty);
-                if (trade.isBuyerMaker) { // If true, it's a sell order (taker sells to maker)
-                    volumeDeltaStore[symbol].sellVolume = volumeDeltaStore[symbol].sellVolume.plus(quantity);
-                } else { // If false, it's a buy order (taker buys from maker)
-                    volumeDeltaStore[symbol].buyVolume = volumeDeltaStore[symbol].buyVolume.plus(quantity);
-                }
-                volumeDeltaStore[symbol].lastUpdated = Date.now();
-            }
-        } catch (e) {
-            console.error(`[WS ${symbol}] Erro ao processar mensagem: ${e.message}`);
-        }
-    });
-
-    ws.on("open", () => console.log(`[WS ${symbol}] Conectado ao WebSocket de trades.`));
-    ws.on("close", () => console.log(`[WS ${symbol}] Desconectado do WebSocket de trades.`));
-    ws.on("error", (err) => console.error(`[WS ${symbol}] Erro no WebSocket: ${err.message}`));
-}
-
-// Start WebSocket for each monitored pair
-PARES_MONITORADOS.forEach(startVolumeDeltaSocket);
-
-// Update normalized delta every minute
-setInterval(() => {
-    for (const symbol in volumeDeltaStore) {
-        const data = volumeDeltaStore[symbol];
-        const totalVolume = data.buyVolume.plus(data.sellVolume);
-        if (!totalVolume.isZero()) {
-            data.normalizedDelta = data.buyVolume.minus(data.sellVolume).dividedBy(totalVolume);
-        } else {
-            data.normalizedDelta = new Decimal(0);
-        }
-        // Reset volumes for next interval
-        data.buyVolume = new Decimal(0);
-        data.sellVolume = new Decimal(0);
-    }
-}, 60000); // Update every minute
-
 // ================= BOT ================= //
 class TradingBot {
     constructor() {
@@ -205,7 +118,7 @@ class TradingBot {
     }
 
     async fetchKlines(symbol, interval, limit) {
-        const url = "https://fapi.binance.com/fapi/v1/klines"; 
+        const url = "https://fapi.binance.com/fapi/v1/klines";
         try {
             const res = await axios.get(url, { params: { symbol, interval, limit } });
             return {
@@ -220,7 +133,7 @@ class TradingBot {
     }
 
     async fetchLSR(symbol) {
-        const url = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"; 
+        const url = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio";
         try {
             const res = await axios.get(url, { params: { symbol, period: "5m", limit: 2 } });
             if (res.data && res.data.length >= 2) {
@@ -237,7 +150,7 @@ class TradingBot {
     }
 
     async fetchOpenInterest(symbol) {
-        const url = "https://fapi.binance.com/futures/data/openInterestHist"; 
+        const url = "https://fapi.binance.com/futures/data/openInterestHist";
         try {
             const res = await axios.get(url, { params: { symbol, period: "5m", limit: 2 } });
             if (res.data && res.data.length >= 2) {
@@ -274,37 +187,37 @@ class TradingBot {
         for (const par of PARES_MONITORADOS) {
             console.log(`--- Verificando ${par} ---`);
             try {
-                const [data15m, data1h, data4h, data1d] = await Promise.all([
+                const [data3m, data1h, data4h, data1d] = await Promise.all([
                     this.fetchKlines(par, "15m", 200),
                     this.fetchKlines(par, "1h", 100),
                     this.fetchKlines(par, "4h", 100),
                     this.fetchKlines(par, "1d", 100),
                 ]);
-                if (data15m.closes.length < 50 || data1h.closes.length < 50) {
-                    console.log(`[${par}] Dados insuficientes (15m: ${data15m.closes.length}, 1h: ${data1h.closes.length}).`);
+
+                if (data3m.closes.length < 50 || data1h.closes.length < 50) {
+                    console.log(`[${par}] Dados insuficientes (3m: ${data3m.closes.length}, 1h: ${data1h.closes.length}).`);
                     continue;
                 }
 
-                const ema17Series = getEMASeries(data15m.closes, 17);
-                const ema13Series = getEMASeries(data15m.closes, 13);
-                const ema34Series = getEMASeries(data15m.closes, 34);
-                const currentRsi = calculateRSI(data15m.closes, RSI_PERIOD);
-                const currentAtr = calculateATR(data15m.highs, data15m.lows, data15m.closes);
-                const currentPrice = new Decimal(data15m.closes[data15m.closes.length - 1]);
-
-                const currentCci = calculateCCI(data15m.highs, data15m.lows, data15m.closes);
-                const cciValues = data15m.closes.map((c, i) =>
+                const ema17Series = getEMASeries(data3m.closes, 17);
+                const ema13Series = getEMASeries(data3m.closes, 13);
+                const ema34Series = getEMASeries(data3m.closes, 34);
+                const currentRsi = calculateRSI(data3m.closes, RSI_PERIOD);
+                const currentAtr = calculateATR(data3m.highs, data3m.lows, data3m.closes);
+                const currentPrice = new Decimal(data3m.closes[data3m.closes.length - 1]);
+                const currentCci = calculateCCI(data3m.highs, data3m.lows, data3m.closes);
+                const cciValues = data3m.closes.map((c, i) =>
                     calculateCCI(
-                        data15m.highs.slice(0, i + 1),
-                        data15m.lows.slice(0, i + 1),
-                        data15m.closes.slice(0, i + 1)
+                        data3m.highs.slice(0, i + 1),
+                        data3m.lows.slice(0, i + 1),
+                        data3m.closes.slice(0, i + 1)
                     )
                 ).filter(val => val !== null);
                 const cciSma = calculateSMA(cciValues, CCI_SMA_PERIOD);
-
                 const oiData = await this.fetchOpenInterest(par);
                 const lsrData = await this.fetchLSR(par);
 
+                // NOVO: CCI do 1h para filtro em SHORT
                 const currentCci1h = calculateCCI(data1h.highs, data1h.lows, data1h.closes);
                 const cci1hValues = data1h.closes.map((c, i) =>
                     calculateCCI(
@@ -315,16 +228,11 @@ class TradingBot {
                 ).filter(val => val !== null);
                 const cci1hSma = calculateSMA(cci1hValues, CCI_SMA_PERIOD);
 
-                // Get normalized volume delta for the current pair
-                const currentNormalizedDelta = volumeDeltaStore[par] ? volumeDeltaStore[par].normalizedDelta : new Decimal(0);
-
-                // Check if essential data is available
                 if (
                     currentPrice === null || currentAtr === null ||
                     ema17Series.current === null || ema34Series.current === null ||
                     oiData.current === null || lsrData.current === null ||
-                    currentCci1h === null || cci1hSma === null ||
-                    currentNormalizedDelta === null // Ensure delta is not null
+                    currentCci1h === null || cci1hSma === null
                 ) {
                     console.log(`[${par}] Falha ao calcular dados essenciais. Pulando.`);
                     continue;
@@ -333,18 +241,17 @@ class TradingBot {
                 const oiChange = calculatePercentChange(oiData.current, oiData.previous);
                 const lsrChange = calculatePercentChange(lsrData.current, lsrData.previous);
 
-                // LONG SIGNAL
+                // --- Check Long Signal --- //
                 const isCciLong = currentCci?.gt(cciSma) && currentCci?.gt(new Decimal(-100));
                 const isCrossover = checkCrossover(ema17Series, ema34Series);
-                const isOiUpEnough = oiChange.value?.isPositive() && oiChange.value?.gte(OI_PERCENT_CHANGE_THRESHOLD);
+                const isOiUp = oiChange.value?.isPositive();
+                const isOiUpEnough = isOiUp && oiChange.value?.gte(OI_PERCENT_CHANGE_THRESHOLD);
                 const isLsrFalling = lsrChange.value?.isNegative();
                 const lsrBelowThreshold = lsrData.current.lt(LSR_BUY_THRESHOLD);
-                const isStrongBuyPressure = currentNormalizedDelta.gt(VOLUME_DELTA_THRESHOLD); // Delta positivo
 
                 const chaveLong = `${par}_LONG`;
                 const agora = Date.now();
-
-                if (isCciLong && isCrossover && isOiUpEnough && isLsrFalling && lsrBelowThreshold && isStrongBuyPressure) {
+                if (isCciLong && isCrossover && isOiUpEnough && isLsrFalling && lsrBelowThreshold) {
                     if (
                         ultimosSinais[chaveLong] &&
                         (agora - ultimosSinais[chaveLong]) < TEMPO_MINIMO_ENTRE_SINAIS_MS
@@ -353,34 +260,37 @@ class TradingBot {
                     } else {
                         const reentryPrice = currentPrice.minus(currentAtr.times(ATR_REENTRY_MULTIPLIER));
                         const finalStopLoss = currentPrice.minus(currentAtr.times(ATR_FINAL_STOP_MULTIPLIER));
-                        const target1 = currentPrice.plus(currentAtr.times(TARGET_1_ATR_MULT));
-                        const target2 = currentPrice.plus(currentAtr.times(TARGET_2_ATR_MULT));
-                        const target3 = currentPrice.plus(currentAtr.times(TARGET_3_ATR_MULT));
+                        const risk = currentPrice.minus(finalStopLoss);
 
-                        const msg = `🟢 *LONG* (${par})
-*Entrys:* ${formatDecimal(currentPrice, 5)} - ${formatDecimal(reentryPrice, 5)}
-Leverage: ${LEVERAGE_DEFAULT}X
-*Tps:* ${formatDecimal(target1, 5)} - ${formatDecimal(target2, 5)} - ${formatDecimal(target3, 5)}
-*Stop Loss:* ${formatDecimal(finalStopLoss, 5)}`;
+                        const target1 = currentPrice.plus(risk.times(RRR_TARGET_1));
+                        const target2 = currentPrice.plus(risk.times(RRR_TARGET_2));
+                        const target3 = currentPrice.plus(risk.times(RRR_TARGET_3));
+
+                        const msg = `🟢 *LONG* (${par})\n` +
+                            `*Entrys:* ${formatDecimal(currentPrice, 5)} - ${formatDecimal(reentryPrice, 5)}\n` +
+                            `Leverage: ${LEVERAGE_DEFAULT}X\n` +
+                            `*Tps:* ${formatDecimal(target1, 5)} - ${formatDecimal(target2, 5)} - ${formatDecimal(target3, 5)}\n` +
+                            `*Stop Loss:* ${formatDecimal(finalStopLoss, 5)}\n`;
+
                         await this.sendAlert(msg);
                         console.log(`[${par}] Alerta LONG enviado.`);
                         ultimosSinais[chaveLong] = agora;
                     }
                 }
 
-                // SHORT SIGNAL
+                // --- Check Short Signal --- //
+                // NOVO: só envia SHORT se CCI 15m e CCI 1h negativos em relação à sua SMA
                 const isCciShort = currentCci?.lt(cciSma) && currentCci?.lt(new Decimal(100));
                 const isCci1hShort = currentCci1h?.lt(cci1hSma) && currentCci1h?.lt(new Decimal(100));
                 const isCrossunder = checkCrossunder(ema17Series, ema34Series);
-                const isOiDownEnough = oiChange.value?.isNegative() && oiChange.value?.abs().gte(OI_PERCENT_CHANGE_THRESHOLD);
+                const isOiDown = oiChange.value?.isNegative();
+                const isOiDownEnough = isOiDown && oiChange.value?.abs().gte(OI_PERCENT_CHANGE_THRESHOLD);
                 const isLsrRising = lsrChange.value?.isPositive();
                 const lsrAboveThreshold = lsrData.current.gt(LSR_SELL_THRESHOLD);
-                const isStrongSellPressure = currentNormalizedDelta.lt(VOLUME_DELTA_THRESHOLD.neg()); // Delta negativo
 
                 const chaveShort = `${par}_SHORT`;
-
                 if (
-                    isCciShort && isCci1hShort && isCrossunder && isOiDownEnough && isLsrRising && lsrAboveThreshold && isStrongSellPressure
+                    isCciShort && isCci1hShort && isCrossunder && isOiDownEnough && isLsrRising && lsrAboveThreshold
                 ) {
                     if (
                         ultimosSinais[chaveShort] &&
@@ -390,15 +300,18 @@ Leverage: ${LEVERAGE_DEFAULT}X
                     } else {
                         const reentryPrice = currentPrice.plus(currentAtr.times(ATR_REENTRY_MULTIPLIER));
                         const finalStopLoss = currentPrice.plus(currentAtr.times(ATR_FINAL_STOP_MULTIPLIER));
-                        const target1 = currentPrice.minus(currentAtr.times(TARGET_1_ATR_MULT));
-                        const target2 = currentPrice.minus(currentAtr.times(TARGET_2_ATR_MULT));
-                        const target3 = currentPrice.minus(currentAtr.times(TARGET_3_ATR_MULT));
+                        const risk = finalStopLoss.minus(currentPrice);
 
-                        const msg = `🔴 *SHORT* (${par})
-*Entrys:* ${formatDecimal(currentPrice, 5)}-${formatDecimal(reentryPrice, 5)}
-Leverage: ${LEVERAGE_DEFAULT}X
-*Tps :*${formatDecimal(target1, 5)} - ${formatDecimal(target2, 5)} - ${formatDecimal(target3, 5)}
-*Stop Loss:* ${formatDecimal(finalStopLoss, 5)}`;
+                        const target1 = currentPrice.minus(risk.times(RRR_TARGET_1));
+                        const target2 = currentPrice.minus(risk.times(RRR_TARGET_2));
+                        const target3 = currentPrice.minus(risk.times(RRR_TARGET_3));
+
+                        const msg = `🔴 *SHORT* (${par})\n` +
+                            `*Entrys:* ${formatDecimal(currentPrice, 5)}-${formatDecimal(reentryPrice, 5)}\n` +
+                            `Leverage: ${LEVERAGE_DEFAULT}X\n` +
+                            `*Tps :*${formatDecimal(target1, 5)} - ${formatDecimal(target2, 5)} - ${formatDecimal(target3, 5)}\n` +
+                            `*Stop Loss:* ${formatDecimal(finalStopLoss, 5)}\n`;
+
                         await this.sendAlert(msg);
                         console.log(`[${par}] Alerta SHORT enviado.`);
                         ultimosSinais[chaveShort] = agora;
@@ -421,14 +334,53 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 }
 
 const botInstance = new TradingBot();
-console.log("🤖 Bot (v5 - CCI + DELTA + LSR & OI%) iniciando... Verificação de sinais a cada " + (INTERVALO_VERIFICACAO_MS / 1000 / 60) + " minutos.");
-
-// Start the signal checking loop
+console.log("🤖 Bot (v4 - Reentrada + OI%) iniciando... Verificação inicial em 5 segundos.");
+setTimeout(() => botInstance.checkSignals(), 5000);
 setInterval(() => botInstance.checkSignals(), INTERVALO_VERIFICACAO_MS);
 
-// Start the Telegram bot
-botInstance.bot.launch();
+process.on("unhandledRejection", (reason, promise) => {
+    console.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
+process.on("uncaughtException", (error) => {
+    console.error("Uncaught Exception thrown:", error);
+});
 
-// Enable graceful stop
-process.once("SIGINT", () => botInstance.bot.stop("SIGINT"));
-process.once("SIGTERM", () => botInstance.bot.stop("SIGTERM"));
+function calculateCCI(highs, lows, closes, period = CCI_PERIOD) {
+    if (highs.length < period || lows.length < period || closes.length < period) return null;
+    try {
+        const typicalPrices = closes.map((c, i) => new Decimal(c).plus(new Decimal(highs[i])).plus(new Decimal(lows[i])).dividedBy(3));
+        const cciResult = [];
+
+        for (let i = period - 1; i < typicalPrices.length; i++) {
+            const slice = typicalPrices.slice(i - period + 1, i + 1);
+            const sma = slice.reduce((a, b) => a.plus(b), new Decimal(0)).dividedBy(period);
+            const meanDeviation = slice.reduce((sum, val) => sum.plus(val.minus(sma).abs()), new Decimal(0)).dividedBy(period);
+
+            if (meanDeviation.isZero()) {
+                cciResult.push(new Decimal(0));
+            } else {
+                cciResult.push(typicalPrices[i].minus(sma).dividedBy(new Decimal(0.015).times(meanDeviation)));
+            }
+        }
+        return cciResult.length ? cciResult[cciResult.length - 1] : null;
+    } catch (e) {
+        console.error(`[CCI Calc] Erro: ${e.message}`);
+        return null;
+    }
+}
+
+function calculateSMA(values, period) {
+    if (values.length < period) return null;
+    try {
+        const smaResult = [];
+        for (let i = period - 1; i < values.length; i++) {
+            const slice = values.slice(i - period + 1, i + 1);
+            const sum = slice.reduce((a, b) => a.plus(b), new Decimal(0));
+            smaResult.push(sum.dividedBy(period));
+        }
+        return smaResult.length ? smaResult[smaResult.length - 1] : null;
+    } catch (e) {
+        console.error(`[SMA Calc] Erro: ${e.message}`);
+        return null;
+    }
+}
