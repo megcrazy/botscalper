@@ -336,7 +336,7 @@ class TradingBot {
                 const lsrChange = calculatePercentChange(lsrData.current, lsrData.previous);
 
                 // LONG SIGNAL
-                const isCciLong = currentCci?.gt(cciSma) && currentCci?.gt(new Decimal(-100));
+                const isCciLong = currentCci?.gt(cciSma) && currentCci?.gt(new Decimal(-100) && currentCci?.lt(new Decimal(200));
                 const isCrossover = checkCrossover(ema17Series, ema34Series);
                 const isOiUpEnough = oiChange.value?.isPositive() && oiChange.value?.gte(OI_PERCENT_CHANGE_THRESHOLD);
                 const isLsrFalling = lsrChange.value?.isNegative();
@@ -372,7 +372,8 @@ Leverage: ${LEVERAGE_DEFAULT}X
                 }
 
                 // SHORT SIGNAL
-                const isCciShort = currentCci?.lt(cciSma) && currentCci?.lt(new Decimal(100));
+              
+                const isCciShort = currentCci?.lt(cciSma) && currentCci?.lt(new Decimal(100)) && currentCci?.gt(new Decimal(-200));
                 const isCci1hShort = currentCci1h?.lt(cci1hSma) && currentCci1h?.lt(new Decimal(100));
                 const isCrossunder = checkCrossunder(ema17Series, ema34Series);
                 const isOiDownEnough = oiChange.value?.isNegative() && oiChange.value?.abs().gte(OI_PERCENT_CHANGE_THRESHOLD);
