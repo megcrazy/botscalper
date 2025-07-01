@@ -18,6 +18,10 @@ const EMA_3M_PERIODS = [17,34];
 const RSI_PERIOD = 14;
 const ATR_PERIOD = 14;
 
+// --- CCI Premium/Discount Thresholds --- //
+const CCI_PREMIUM_THRESHOLD = new Decimal("200"); // Sobrecompra
+const CCI_DISCOUNT_THRESHOLD = new Decimal("-200"); // Sobrevenda
+
 // --- ATR and Target Config --- //
 const ATR_REENTRY_MULTIPLIER = new Decimal(process.env.ATR_REENTRY_MULTIPLIER || "1.0");
 const ATR_FINAL_STOP_MULTIPLIER = new Decimal(process.env.ATR_FINAL_STOP_MULTIPLIER || "3.0");
@@ -336,13 +340,14 @@ class TradingBot {
                 const lsrChange = calculatePercentChange(lsrData.current, lsrData.previous);
 
                 // LONG SIGNAL
-                const isCciLong = currentCci?.gt(cciSma) && currentCci?.gt(new Decimal(-100) && currentCci?.lt(new Decimal(200));
+                const isCciLong = currentCci?.gt(cciSma) && currentCci?.gt(new Decimal(-100));
                 const isCrossover = checkCrossover(ema17Series, ema34Series);
                 const isOiUpEnough = oiChange.value?.isPositive() && oiChange.value?.gte(OI_PERCENT_CHANGE_THRESHOLD);
                 const isLsrFalling = lsrChange.value?.isNegative();
                 const lsrBelowThreshold = lsrData.current.lt(LSR_BUY_THRESHOLD);
                 const isVolumeDeltaLong = currentNormalizedDelta.gt(VOLUME_DELTA_THRESHOLD); // Delta positivo
                 const isCci4hBelow200 = currentCci4h?.lt(new Decimal(200)); // New condition for Long: CCI H4 < 200
+                const isNotPremium = currentCci?.lte(CCI_PREMIUM_THRESHOLD); // Evitar LONG em área premium
 
                 const chaveLong = `${par}_LONG`;
                 const agora = Date.now();
@@ -372,15 +377,14 @@ Leverage: ${LEVERAGE_DEFAULT}X
                 }
 
                 // SHORT SIGNAL
-              
-                const isCciShort = currentCci?.lt(cciSma) && currentCci?.lt(new Decimal(100)) && currentCci?.gt(new Decimal(-200));
+                const isCciShort = currentCci?.lt(cciSma) && currentCci?.lt(new Decimal(100));
                 const isCci1hShort = currentCci1h?.lt(cci1hSma) && currentCci1h?.lt(new Decimal(100));
                 const isCrossunder = checkCrossunder(ema17Series, ema34Series);
                 const isOiDownEnough = oiChange.value?.isNegative() && oiChange.value?.abs().gte(OI_PERCENT_CHANGE_THRESHOLD);
                 const isLsrRising = lsrChange.value?.isPositive();
                 const lsrAboveThreshold = lsrData.current.gt(LSR_SELL_THRESHOLD);
                 const isVolumeDeltaShort = currentNormalizedDelta.lt(VOLUME_DELTA_THRESHOLD.neg()); // Delta negativo
-
+                const isNotDiscount = currentCci15?.gte(CCI_DISCOUNT_THRESHOLD); // evitar short em suporte
                 const chaveShort = `${par}_SHORT`;
 
                 if (
@@ -436,5 +440,6 @@ botInstance.bot.launch();
 // Enable graceful stop
 process.once("SIGINT", () => botInstance.bot.stop("SIGINT"));
 process.once("SIGTERM", () => botInstance.bot.stop("SIGTERM"));
+
 
 
